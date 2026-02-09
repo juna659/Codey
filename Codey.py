@@ -27,6 +27,62 @@ except Exception:
     HAS_CODEY_LINTER = False
 
 
+def _ensure_logo_png():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    logo_path = os.path.join(base_dir, 'codey_logo.png')
+    if os.path.isfile(logo_path):
+        return logo_path
+    try:
+        size = 512
+        img = QtGui.QImage(size, size, QtGui.QImage.Format.Format_ARGB32)
+        img.fill(QtGui.QColor('#0f1115'))
+
+        painter = QtGui.QPainter(img)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+
+        # Subtle background circle
+        bg = QtGui.QRadialGradient(QtCore.QPointF(size * 0.5, size * 0.45), size * 0.6)
+        bg.setColorAt(0.0, QtGui.QColor('#151a22'))
+        bg.setColorAt(1.0, QtGui.QColor('#0f1115'))
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(bg)
+        painter.drawEllipse(QtCore.QRectF(32, 32, size - 64, size - 64))
+
+        # Snake "C" body
+        margin = 84
+        rect = QtCore.QRectF(margin, margin, size - 2 * margin, size - 2 * margin)
+        path = QtGui.QPainterPath()
+        path.arcMoveTo(rect, 40)
+        path.arcTo(rect, 40, 280)
+        pen = QtGui.QPen(QtGui.QColor('#3ddc84'), 58)
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(QtCore.Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+        painter.drawPath(path)
+
+        # Snake head + eye
+        head = path.pointAtPercent(0.02)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QColor('#3ddc84'))
+        painter.drawEllipse(QtCore.QPointF(head.x(), head.y()), 30, 30)
+        painter.setBrush(QtGui.QColor('#0b0d12'))
+        painter.drawEllipse(QtCore.QPointF(head.x() + 8, head.y() - 6), 6, 6)
+
+        # Inner "++"
+        painter.setPen(QtGui.QColor('#ff9e64'))
+        font = QtGui.QFont('Segoe UI', 120, QtGui.QFont.Weight.Bold)
+        painter.setFont(font)
+        painter.drawText(QtCore.QRectF(0, 0, size, size),
+                         QtCore.Qt.AlignmentFlag.AlignCenter, '++')
+
+        painter.end()
+        img.save(logo_path, 'PNG')
+        return logo_path
+    except Exception:
+        return None
+
+
 class FallbackLinter(object):
     """Minimal fallback linter when CodeyLinter is unavailable."""
 
@@ -171,6 +227,12 @@ class CodeyHighlighter(QtGui.QSyntaxHighlighter):
         super(CodeyHighlighter, self).__init__(document)
         self.language = language
         self.rules = []
+        self._string_fmt = None
+        self._comment_fmt = None
+        self._triple_double = QtCore.QRegularExpression('\"\"\"')
+        self._triple_single = QtCore.QRegularExpression("\'\'\'")
+        self._block_comment_start = QtCore.QRegularExpression('/\\*')
+        self._block_comment_end = QtCore.QRegularExpression('\\*/')
         self._build_rules()
 
     def _fmt(self, color, bold=False, italic=False):
@@ -189,6 +251,13 @@ class CodeyHighlighter(QtGui.QSyntaxHighlighter):
         string_fmt = self._fmt('#9ece6a')
         comment_fmt = self._fmt('#6b7089', italic=True)
         number_fmt = self._fmt('#ff9e64')
+        func_fmt = self._fmt('#7dcfff')
+        class_fmt = self._fmt('#2ac3de', bold=True)
+        decorator_fmt = self._fmt('#f7768e')
+        preproc_fmt = self._fmt('#e0af68', bold=True)
+        const_fmt = self._fmt('#ff9e64', bold=True)
+        self._string_fmt = string_fmt
+        self._comment_fmt = comment_fmt
 
         if self.language == 'python':
             keywords = [
@@ -209,7 +278,40 @@ class CodeyHighlighter(QtGui.QSyntaxHighlighter):
             self.rules.append((r'#.*', comment_fmt))
             self.rules.append((r'\".*?\"', string_fmt))
             self.rules.append((r"\'.*?\'", string_fmt))
+            self.rules.append((r'\"\"\".*?\"\"\"', string_fmt))
+            self.rules.append((r"\'\'\'.*?\'\'\'", string_fmt))
             self.rules.append((r'\b[0-9]+(\.[0-9]+)?\b', number_fmt))
+            self.rules.append((r'\bTrue\b|\bFalse\b|\bNone\b', const_fmt))
+            self.rules.append((r'@\w+', decorator_fmt))
+            self.rules.append((r'\bclass\s+([A-Za-z_][A-Za-z0-9_]*)', class_fmt))
+            self.rules.append((r'\bdef\s+([A-Za-z_][A-Za-z0-9_]*)', func_fmt))
+        elif self.language == 'javascript':
+            keywords = [
+                'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger',
+                'default', 'delete', 'do', 'else', 'export', 'extends', 'finally',
+                'for', 'function', 'if', 'import', 'in', 'instanceof', 'let',
+                'new', 'return', 'super', 'switch', 'this', 'throw', 'try',
+                'typeof', 'var', 'void', 'while', 'with', 'yield', 'await', 'async',
+            ]
+            builtins = [
+                'Array', 'Boolean', 'Date', 'Error', 'Function', 'JSON', 'Math',
+                'Number', 'Object', 'Promise', 'RegExp', 'Set', 'String', 'Map',
+                'WeakMap', 'WeakSet', 'Symbol', 'BigInt', 'console', 'window',
+                'document', 'undefined', 'null', 'NaN', 'Infinity',
+            ]
+            for word in keywords:
+                self.rules.append((r'\b%s\b' % word, keyword_fmt))
+            for word in builtins:
+                self.rules.append((r'\b%s\b' % word, type_fmt))
+            self.rules.append((r'//.*', comment_fmt))
+            self.rules.append((r'/\*.*\*/', comment_fmt))
+            self.rules.append((r'\".*?\"', string_fmt))
+            self.rules.append((r"\'.*?\'", string_fmt))
+            self.rules.append((r'\b[0-9]+(\.[0-9]+)?\b', number_fmt))
+            self.rules.append((r'\b(true|false|null|undefined|NaN|Infinity)\b', const_fmt))
+            self.rules.append((r'\bclass\s+([A-Za-z_][A-Za-z0-9_]*)', class_fmt))
+            self.rules.append((r'\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)', func_fmt))
+            self.rules.append((r'\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()', func_fmt))
         else:
             keywords = [
                 'auto', 'break', 'case', 'char', 'const', 'continue', 'default',
@@ -228,15 +330,182 @@ class CodeyHighlighter(QtGui.QSyntaxHighlighter):
             self.rules.append((r'\".*?\"', string_fmt))
             self.rules.append((r"\'.*?\'", string_fmt))
             self.rules.append((r'\b[0-9]+(\.[0-9]+)?\b', number_fmt))
+            self.rules.append((r'^\s*#\s*(include|define|ifdef|ifndef|endif|pragma).*$', preproc_fmt))
+            self.rules.append((r'\b(true|false|nullptr)\b', const_fmt))
+            self.rules.append((r'\bclass\s+([A-Za-z_][A-Za-z0-9_]*)', class_fmt))
+            self.rules.append((r'\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()', func_fmt))
 
         self.rules = [(QtCore.QRegularExpression(pat), fmt) for pat, fmt in self.rules]
 
     def highlightBlock(self, text):
+        self.setCurrentBlockState(0)
         for pattern, fmt in self.rules:
             it = pattern.globalMatch(text)
             while it.hasNext():
                 match = it.next()
                 self.setFormat(match.capturedStart(), match.capturedLength(), fmt)
+
+        if self.language == 'python':
+            if self._string_fmt:
+                if self._apply_multiline(text, self._triple_double, self._triple_double, 1, self._string_fmt):
+                    return
+                self._apply_multiline(text, self._triple_single, self._triple_single, 2, self._string_fmt)
+            return
+
+        if self.language in ('javascript', 'c', 'cpp'):
+            if self._comment_fmt:
+                self._apply_multiline(text, self._block_comment_start, self._block_comment_end, 3, self._comment_fmt)
+
+    def _apply_multiline(self, text, start_pat, end_pat, state_id, fmt):
+        if self.previousBlockState() == state_id:
+            start = 0
+        else:
+            match = start_pat.match(text)
+            start = match.capturedStart() if match.hasMatch() else -1
+
+        while start >= 0:
+            end_match = end_pat.match(text, start + 1)
+            if end_match.hasMatch():
+                end = end_match.capturedEnd()
+                self.setFormat(start, end - start, fmt)
+                next_match = start_pat.match(text, end)
+                start = next_match.capturedStart() if next_match.hasMatch() else -1
+            else:
+                self.setFormat(start, len(text) - start, fmt)
+                self.setCurrentBlockState(state_id)
+                return True
+        return False
+
+
+class ImageViewerDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None, path=None):
+        super(ImageViewerDialog, self).__init__(parent)
+        self.setWindowTitle('Image Viewer')
+        self.setModal(False)
+        self.resize(900, 600)
+        self._path = path
+        self._scale = 1.0
+        self._pixmap = None
+        self._build_ui()
+        self._apply_styles()
+        if path:
+            self.load_image(path)
+
+    def _build_ui(self):
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+
+        toolbar = QtWidgets.QHBoxLayout()
+        self.path_label = QtWidgets.QLabel('No image loaded')
+        self.path_label.setObjectName('imagePath')
+        self.btn_open = QtWidgets.QPushButton('Open')
+        self.btn_fit = QtWidgets.QPushButton('Fit')
+        self.btn_actual = QtWidgets.QPushButton('100%')
+        self.btn_zoom_in = QtWidgets.QPushButton('Zoom +')
+        self.btn_zoom_out = QtWidgets.QPushButton('Zoom -')
+
+        self.btn_open.clicked.connect(self._pick_image)
+        self.btn_fit.clicked.connect(self._fit_to_view)
+        self.btn_actual.clicked.connect(self._actual_size)
+        self.btn_zoom_in.clicked.connect(lambda: self._zoom(1.25))
+        self.btn_zoom_out.clicked.connect(lambda: self._zoom(0.8))
+
+        toolbar.addWidget(self.btn_open)
+        toolbar.addWidget(self.btn_fit)
+        toolbar.addWidget(self.btn_actual)
+        toolbar.addWidget(self.btn_zoom_in)
+        toolbar.addWidget(self.btn_zoom_out)
+        toolbar.addStretch(1)
+        toolbar.addWidget(self.path_label)
+
+        self.image_label = QtWidgets.QLabel()
+        self.image_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setObjectName('imageCanvas')
+
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidget(self.image_label)
+
+        root.addLayout(toolbar)
+        root.addWidget(self.scroll, 1)
+
+    def _apply_styles(self):
+        self.setStyleSheet("""
+            QDialog {
+                background: #0f1115;
+                color: #e6e6e6;
+            }
+            #imagePath {
+                color: #9aa4b2;
+            }
+            QPushButton {
+                background: #1f2633;
+                border: 1px solid #2a3345;
+                border-radius: 6px;
+                padding: 6px 10px;
+            }
+            QPushButton:hover {
+                background: #293145;
+            }
+            #imageCanvas {
+                background: #0b0d12;
+                border: 1px solid #202634;
+                border-radius: 6px;
+            }
+        """)
+
+    def _pick_image(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, 'Open Image', '', 'Images (*.png *.jpg *.jpeg *.bmp *.gif)'
+        )
+        if not path:
+            return
+        self.load_image(path)
+
+    def load_image(self, path):
+        pixmap = QtGui.QPixmap(path)
+        if pixmap.isNull():
+            QtWidgets.QMessageBox.warning(self, 'Image Viewer', 'Failed to load image.')
+            return
+        self._path = path
+        self._pixmap = pixmap
+        self._scale = 1.0
+        self.path_label.setText(os.path.basename(path))
+        self._render()
+
+    def _render(self):
+        if not self._pixmap:
+            return
+        scaled = self._pixmap.scaled(
+            self._pixmap.size() * self._scale,
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation
+        )
+        self.image_label.setPixmap(scaled)
+
+    def _zoom(self, factor):
+        if not self._pixmap:
+            return
+        self._scale = max(0.1, min(6.0, self._scale * factor))
+        self._render()
+
+    def _fit_to_view(self):
+        if not self._pixmap:
+            return
+        view = self.scroll.viewport().size()
+        if view.width() <= 0 or view.height() <= 0:
+            return
+        scale_w = view.width() / self._pixmap.width()
+        scale_h = view.height() / self._pixmap.height()
+        self._scale = max(0.05, min(6.0, min(scale_w, scale_h)))
+        self._render()
+
+    def _actual_size(self):
+        if not self._pixmap:
+            return
+        self._scale = 1.0
+        self._render()
 
 
 class CodeyApp(QtWidgets.QMainWindow):
@@ -293,7 +562,11 @@ class CodeyApp(QtWidgets.QMainWindow):
         self._apply_syntax_highlighting()
 
     def _set_window_icon(self):
-        """Set a simple window icon using built-in style."""
+        """Set window icon using Codey logo when available."""
+        logo_path = _ensure_logo_png()
+        if logo_path and os.path.isfile(logo_path):
+            self.setWindowIcon(QtGui.QIcon(logo_path))
+            return
         icon = self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_FileIcon)
         self.setWindowIcon(icon)
 
@@ -414,6 +687,10 @@ class CodeyApp(QtWidgets.QMainWindow):
         screenshot_action.setShortcut('Ctrl+Shift+P')
         screenshot_action.triggered.connect(self.take_screenshot)
         tools_menu.addAction(screenshot_action)
+        image_viewer_action = QtGui.QAction('Image Viewer', self)
+        image_viewer_action.setShortcut('Ctrl+Shift+I')
+        image_viewer_action.triggered.connect(self.open_image_viewer)
+        tools_menu.addAction(image_viewer_action)
         
         # Help Menu
         help_menu = menubar.addMenu('❓ Help')
@@ -1498,6 +1775,10 @@ class CodeyApp(QtWidgets.QMainWindow):
             self.set_status('Screenshot failed')
             return
         self.set_status(f'Screenshot saved: {os.path.basename(path)}')
+
+    def open_image_viewer(self, path=None):
+        dialog = ImageViewerDialog(self, path=path)
+        dialog.show()
 
     def _apply_syntax_highlighting(self):
         tab = self._current_tab()
