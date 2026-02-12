@@ -353,6 +353,21 @@ def _lint_javascript_eslint(text: str) -> List[Dict]:
     return diagnostics
 
 
+def _lint_json(text: str) -> List[Dict]:
+    try:
+        json.loads(text)
+        return []
+    except json.JSONDecodeError as exc:
+        return [_create_diagnostic(
+            line=exc.lineno or 1,
+            col=exc.colno or 1,
+            message=exc.msg or 'Invalid JSON',
+            severity='error'
+        )]
+    except Exception as exc:
+        return [_create_diagnostic(1, 1, f'JSON linting error: {exc}', 'error')]
+
+
 def _pick_compiler(is_cpp: bool) -> Optional[str]:
     candidates = ['clang++', 'g++'] if is_cpp else ['clang', 'gcc']
     for tool in candidates:
@@ -470,6 +485,14 @@ def lint(text: str, language: str, file_path: Optional[str] = None) -> List[Dict
         result = _lint_javascript_eslint(text)
         _cache_set(cache_key, result)
         return result
+    elif language == 'json':
+        result = _lint_json(text)
+        _cache_set(cache_key, result)
+        return result
+    elif language in ('log', 'text'):
+        result = []
+        _cache_set(cache_key, result)
+        return result
     elif language == 'c':
         result = _lint_c_compiler(text, False)
         _cache_set(cache_key, result)
@@ -489,7 +512,7 @@ def get_supported_languages() -> List[str]:
     Returns:
         List of supported language identifiers
     """
-    return ['python', 'javascript', 'c', 'cpp']
+    return ['python', 'javascript', 'json', 'c', 'cpp', 'log', 'text']
 
 
 def check_tool_availability() -> Dict[str, bool]:

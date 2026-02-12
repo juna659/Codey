@@ -8,6 +8,8 @@ import sqlite3
 import sys
 import threading
 import time
+import fnmatch
+import json
 
 try:
     from PyQt6 import QtCore, QtGui, QtWidgets
@@ -83,6 +85,31 @@ def _ensure_logo_png():
         return None
 
 
+def _path_matches_ignore(abs_path, workspace_root, ignore_patterns):
+    if not abs_path or not workspace_root:
+        return False
+    try:
+        rel = os.path.relpath(abs_path, workspace_root)
+    except Exception:
+        return False
+    if rel == '.':
+        return False
+    rel = rel.replace('\\', '/')
+    basename = os.path.basename(abs_path)
+    for pattern in ignore_patterns or []:
+        pat = (pattern or '').strip()
+        if not pat:
+            continue
+        if pat.endswith('/'):
+            prefix = pat.rstrip('/').replace('\\', '/')
+            if rel == prefix or rel.startswith(prefix + '/'):
+                return True
+            continue
+        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(basename, pat):
+            return True
+    return False
+
+
 class FallbackLinter(object):
     """Minimal fallback linter when CodeyLinter is unavailable."""
 
@@ -96,6 +123,19 @@ class FallbackLinter(object):
                     'line': exc.lineno or 1,
                     'col': exc.offset or 1,
                     'message': exc.msg,
+                    'severity': 'error',
+                })
+        elif language == 'json':
+            try:
+                import json
+                json.loads(text)
+            except Exception as exc:
+                line_no = getattr(exc, 'lineno', 1) or 1
+                col_no = getattr(exc, 'colno', 1) or 1
+                diagnostics.append({
+                    'line': line_no,
+                    'col': col_no,
+                    'message': str(exc),
                     'severity': 'error',
                 })
         return diagnostics
@@ -222,6 +262,61 @@ class LintWorker(QtCore.QThread):
             self.error.emit(str(exc))
 
 
+class FindInFilesWorker(QtCore.QThread):
+    result = QtCore.pyqtSignal(list)
+    error = QtCore.pyqtSignal(str)
+
+    def __init__(self, workspace_root, query, case_sensitive, max_results, ignore_patterns, parent=None):
+        super(FindInFilesWorker, self).__init__(parent)
+        self._workspace_root = workspace_root
+        self._query = query
+        self._case_sensitive = case_sensitive
+        self._max_results = max_results
+        self._ignore_patterns = ignore_patterns or []
+
+    def run(self):
+        if not self._workspace_root or not self._query:
+            self.result.emit([])
+            return
+        results = []
+        needle = self._query if self._case_sensitive else self._query.lower()
+        try:
+            for root, dirs, files in os.walk(self._workspace_root):
+                if self.isInterruptionRequested():
+                    return
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith('.') and not _path_matches_ignore(
+                        os.path.join(root, d), self._workspace_root, self._ignore_patterns
+                    )
+                ]
+                for filename in files:
+                    if filename.startswith('.'):
+                        continue
+                    full = os.path.join(root, filename)
+                    if _path_matches_ignore(full, self._workspace_root, self._ignore_patterns):
+                        continue
+                    try:
+                        with open(full, 'r', encoding='utf-8', errors='replace') as f:
+                            for line_no, line in enumerate(f, start=1):
+                                hay = line if self._case_sensitive else line.lower()
+                                if needle in hay:
+                                    snippet = line.strip()
+                                    results.append({
+                                        'path': full,
+                                        'line': line_no,
+                                        'text': snippet[:240],
+                                    })
+                                    if len(results) >= self._max_results:
+                                        self.result.emit(results)
+                                        return
+                    except Exception:
+                        continue
+            self.result.emit(results)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 class CodeyHighlighter(QtGui.QSyntaxHighlighter):
     def __init__(self, document, language):
         super(CodeyHighlighter, self).__init__(document)
@@ -256,6 +351,9 @@ class CodeyHighlighter(QtGui.QSyntaxHighlighter):
         decorator_fmt = self._fmt('#f7768e')
         preproc_fmt = self._fmt('#e0af68', bold=True)
         const_fmt = self._fmt('#ff9e64', bold=True)
+        operator_fmt = self._fmt('#89ddff')
+        brace_fmt = self._fmt('#c0caf5')
+        attr_fmt = self._fmt('#73daca')
         self._string_fmt = string_fmt
         self._comment_fmt = comment_fmt
 
@@ -275,16 +373,20 @@ class CodeyHighlighter(QtGui.QSyntaxHighlighter):
                 self.rules.append((r'\b%s\b' % word, keyword_fmt))
             for word in builtins:
                 self.rules.append((r'\b%s\b' % word, type_fmt))
+            self.rules.append((r'==|!=|<=|>=|\+=|-=|\*=|/=|%=|//=|\*\*=|->|:=|[-+/*%=<>!&|^~]+', operator_fmt))
+            self.rules.append((r'[\{\}\[\]\(\)]', brace_fmt))
             self.rules.append((r'#.*', comment_fmt))
             self.rules.append((r'\".*?\"', string_fmt))
             self.rules.append((r"\'.*?\'", string_fmt))
             self.rules.append((r'\"\"\".*?\"\"\"', string_fmt))
             self.rules.append((r"\'\'\'.*?\'\'\'", string_fmt))
-            self.rules.append((r'\b[0-9]+(\.[0-9]+)?\b', number_fmt))
+            self.rules.append((r'\b0[xX][0-9a-fA-F]+\b|\b0[bB][01]+\b|\b[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\b', number_fmt))
             self.rules.append((r'\bTrue\b|\bFalse\b|\bNone\b', const_fmt))
             self.rules.append((r'@\w+', decorator_fmt))
             self.rules.append((r'\bclass\s+([A-Za-z_][A-Za-z0-9_]*)', class_fmt))
             self.rules.append((r'\bdef\s+([A-Za-z_][A-Za-z0-9_]*)', func_fmt))
+            self.rules.append((r'\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()', func_fmt))
+            self.rules.append((r'(?<=\.)[A-Za-z_][A-Za-z0-9_]*', attr_fmt))
         elif self.language == 'javascript':
             keywords = [
                 'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger',
@@ -303,15 +405,33 @@ class CodeyHighlighter(QtGui.QSyntaxHighlighter):
                 self.rules.append((r'\b%s\b' % word, keyword_fmt))
             for word in builtins:
                 self.rules.append((r'\b%s\b' % word, type_fmt))
+            self.rules.append((r'===|!==|==|!=|<=|>=|\+\+|--|\+=|-=|\*=|/=|%=|&&|\|\||=>|[-+/*%=<>!&|^~?:]+', operator_fmt))
+            self.rules.append((r'[\{\}\[\]\(\)]', brace_fmt))
             self.rules.append((r'//.*', comment_fmt))
             self.rules.append((r'/\*.*\*/', comment_fmt))
             self.rules.append((r'\".*?\"', string_fmt))
             self.rules.append((r"\'.*?\'", string_fmt))
-            self.rules.append((r'\b[0-9]+(\.[0-9]+)?\b', number_fmt))
+            self.rules.append((r'`[^`]*`', string_fmt))
+            self.rules.append((r'\b0[xX][0-9a-fA-F]+\b|\b0[bB][01]+\b|\b[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\b', number_fmt))
             self.rules.append((r'\b(true|false|null|undefined|NaN|Infinity)\b', const_fmt))
             self.rules.append((r'\bclass\s+([A-Za-z_][A-Za-z0-9_]*)', class_fmt))
             self.rules.append((r'\bfunction\s+([A-Za-z_][A-Za-z0-9_]*)', func_fmt))
             self.rules.append((r'\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()', func_fmt))
+            self.rules.append((r'(?<=\.)[A-Za-z_][A-Za-z0-9_]*', attr_fmt))
+        elif self.language == 'json':
+            self.rules.append((r'//.*', comment_fmt))
+            self.rules.append((r'/\*.*\*/', comment_fmt))
+            self.rules.append((r'"(?:\\.|[^"\\])*"(?=\s*:)', class_fmt))
+            self.rules.append((r'"(?:\\.|[^"\\])*"', string_fmt))
+            self.rules.append((r'\b(true|false|null)\b', const_fmt))
+            self.rules.append((r'-?\b[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\b', number_fmt))
+            self.rules.append((r'[\{\}\[\]\(\):,]', brace_fmt))
+        elif self.language == 'log':
+            # LOG files are treated as plain text for faster rendering.
+            pass
+        elif self.language == 'text':
+            # Plain text mode intentionally keeps highlighting minimal.
+            self.rules.append((r'$', self._fmt('#c0caf5')))
         else:
             keywords = [
                 'auto', 'break', 'case', 'char', 'const', 'continue', 'default',
@@ -325,15 +445,21 @@ class CodeyHighlighter(QtGui.QSyntaxHighlighter):
             ]
             for word in keywords:
                 self.rules.append((r'\b%s\b' % word, keyword_fmt))
+            self.rules.append((r'::|==|!=|<=|>=|\+\+|--|\+=|-=|\*=|/=|%=|&&|\|\||->|<<|>>|[-+/*%=<>!&|^~?:]+', operator_fmt))
+            self.rules.append((r'[\{\}\[\]\(\)]', brace_fmt))
             self.rules.append((r'//.*', comment_fmt))
             self.rules.append((r'/\*.*\*/', comment_fmt))
             self.rules.append((r'\".*?\"', string_fmt))
             self.rules.append((r"\'.*?\'", string_fmt))
-            self.rules.append((r'\b[0-9]+(\.[0-9]+)?\b', number_fmt))
+            self.rules.append((r'\b0[xX][0-9a-fA-F]+\b|\b0[bB][01]+\b|\b[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?\b', number_fmt))
             self.rules.append((r'^\s*#\s*(include|define|ifdef|ifndef|endif|pragma).*$', preproc_fmt))
             self.rules.append((r'\b(true|false|nullptr)\b', const_fmt))
+            self.rules.append((r'\b(this|nullptr|NULL)\b', const_fmt))
+            self.rules.append((r'\b(std|string|vector|map|unordered_map|set|shared_ptr|unique_ptr)\b', type_fmt))
             self.rules.append((r'\bclass\s+([A-Za-z_][A-Za-z0-9_]*)', class_fmt))
             self.rules.append((r'\b([A-Za-z_][A-Za-z0-9_]*)\s*(?=\()', func_fmt))
+            self.rules.append((r'(?<=\.)[A-Za-z_][A-Za-z0-9_]*', attr_fmt))
+            self.rules.append((r'(?<=->)[A-Za-z_][A-Za-z0-9_]*', attr_fmt))
 
         self.rules = [(QtCore.QRegularExpression(pat), fmt) for pat, fmt in self.rules]
 
@@ -375,6 +501,32 @@ class CodeyHighlighter(QtGui.QSyntaxHighlighter):
                 self.setCurrentBlockState(state_id)
                 return True
         return False
+
+
+class IgnoreFilterProxyModel(QtCore.QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super(IgnoreFilterProxyModel, self).__init__(parent)
+        self._workspace_root = None
+        self._ignore_patterns = []
+        self.setRecursiveFilteringEnabled(True)
+
+    def set_ignore_data(self, workspace_root, ignore_patterns):
+        self._workspace_root = os.path.abspath(workspace_root) if workspace_root else None
+        self._ignore_patterns = list(ignore_patterns or [])
+        self.invalidateFilter()
+
+    def _is_ignored(self, abs_path):
+        return _path_matches_ignore(abs_path, self._workspace_root, self._ignore_patterns)
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        model = self.sourceModel()
+        if model is None:
+            return True
+        idx = model.index(source_row, 0, source_parent)
+        if not idx.isValid():
+            return True
+        path = model.filePath(idx) if hasattr(model, 'filePath') else None
+        return not self._is_ignored(path)
 
 
 class ImageViewerDialog(QtWidgets.QDialog):
@@ -513,6 +665,9 @@ class CodeyApp(QtWidgets.QMainWindow):
     LANG_JS = 'javascript'
     LANG_C = 'c'
     LANG_CPP = 'cpp'
+    LANG_JSON = 'json'
+    LANG_LOG = 'log'
+    LANG_TEXT = 'text'
 
     def __init__(self):
         super(CodeyApp, self).__init__()
@@ -534,6 +689,18 @@ class CodeyApp(QtWidgets.QMainWindow):
         self._lint_pending = None
         self._is_closing = False
         self._pending_close = False
+        self._workspace_path = None
+        self._ignore_patterns = []
+        self._find_worker = None
+        self._file_watch_timer = QtCore.QTimer(self)
+        self._file_watch_timer.setInterval(3000)
+        self._file_watch_timer.timeout.connect(self._check_open_files_changed)
+        self._file_mtimes = {}
+        self._settings = {}
+        self._app_dir = None
+        self._db = None
+        self._db_path = None
+        self._settings_path = None
 
         self._autosave_timer = QtCore.QTimer(self)
         self._autosave_timer.setSingleShot(True)
@@ -545,6 +712,7 @@ class CodeyApp(QtWidgets.QMainWindow):
         self._build_toolbar()
         self._build_sidebar()
         self._build_bottom_panel()
+        self._build_find_panel()
         self._build_terminal_panel()
         self._build_top_bar()
         self._apply_styles()
@@ -552,7 +720,10 @@ class CodeyApp(QtWidgets.QMainWindow):
         self.linter = self._init_linter()
 
         self._init_storage()
+        self._load_settings()
+        self._apply_settings()
         self._init_freeze_handler()
+        self._file_watch_timer.start()
 
         app = QtWidgets.QApplication.instance()
         if app:
@@ -560,6 +731,8 @@ class CodeyApp(QtWidgets.QMainWindow):
         
         self._update_window_title()
         self._apply_syntax_highlighting()
+        if not self._restore_session():
+            self._prompt_for_workspace(initial=True)
 
     def _set_window_icon(self):
         """Set window icon using Codey logo when available."""
@@ -587,11 +760,17 @@ class CodeyApp(QtWidgets.QMainWindow):
 
         # File Menu with icons
         file_menu = menubar.addMenu('📁 File')
+        self.file_menu = file_menu
         
         open_action = QtGui.QAction(self._create_icon(
             QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton), '&Open', self)
         open_action.setShortcut('Ctrl+O')
         open_action.triggered.connect(self.on_open)
+
+        open_folder_action = QtGui.QAction(self._create_icon(
+            QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon), 'Open &Folder...', self)
+        open_folder_action.setShortcut('Ctrl+Shift+O')
+        open_folder_action.triggered.connect(self._prompt_for_workspace)
         
         save_action = QtGui.QAction(self._create_icon(
             QtWidgets.QStyle.StandardPixmap.SP_DialogSaveButton), '&Save', self)
@@ -615,9 +794,19 @@ class CodeyApp(QtWidgets.QMainWindow):
         
         file_menu.addAction(new_action)
         file_menu.addAction(open_action)
+        file_menu.addAction(open_folder_action)
+        file_menu.addSeparator()
+        self.recent_files_menu = file_menu.addMenu('Recent Files')
+        self.recent_files_menu.aboutToShow.connect(self._populate_recent_files_menu)
+        self.recent_workspaces_menu = file_menu.addMenu('Recent Workspaces')
+        self.recent_workspaces_menu.aboutToShow.connect(self._populate_recent_workspaces_menu)
         file_menu.addSeparator()
         file_menu.addAction(save_action)
         file_menu.addAction(save_as_action)
+        file_menu.addSeparator()
+        open_settings_action = QtGui.QAction('Open Settings File', self)
+        open_settings_action.triggered.connect(self._open_settings_file)
+        file_menu.addAction(open_settings_action)
         file_menu.addSeparator()
         file_menu.addAction(quit_action)
 
@@ -640,6 +829,10 @@ class CodeyApp(QtWidgets.QMainWindow):
         find_action.setShortcut('Ctrl+F')
         find_action.triggered.connect(lambda: self.search_input.setFocus())
         edit_menu.addAction(find_action)
+        find_in_files_action = QtGui.QAction('Find in Files', self)
+        find_in_files_action.setShortcut('Ctrl+Shift+F')
+        find_in_files_action.triggered.connect(self._focus_find_in_files)
+        edit_menu.addAction(find_in_files_action)
 
         # Language Menu with icons
         lang_menu = menubar.addMenu('🔧 Language')
@@ -648,16 +841,25 @@ class CodeyApp(QtWidgets.QMainWindow):
         js_action = QtGui.QAction('🟨 JavaScript', self)
         c_action = QtGui.QAction('C', self)
         cpp_action = QtGui.QAction('C++', self)
+        json_action = QtGui.QAction('JSON', self)
+        log_action = QtGui.QAction('LOG', self)
+        text_action = QtGui.QAction('Plain Text', self)
         
         py_action.triggered.connect(lambda: self.set_language(self.LANG_PY))
         js_action.triggered.connect(lambda: self.set_language(self.LANG_JS))
         c_action.triggered.connect(lambda: self.set_language(self.LANG_C))
         cpp_action.triggered.connect(lambda: self.set_language(self.LANG_CPP))
+        json_action.triggered.connect(lambda: self.set_language(self.LANG_JSON))
+        log_action.triggered.connect(lambda: self.set_language(self.LANG_LOG))
+        text_action.triggered.connect(lambda: self.set_language(self.LANG_TEXT))
         
         lang_menu.addAction(py_action)
         lang_menu.addAction(js_action)
         lang_menu.addAction(c_action)
         lang_menu.addAction(cpp_action)
+        lang_menu.addAction(json_action)
+        lang_menu.addAction(log_action)
+        lang_menu.addAction(text_action)
 
         # Lint Menu with icons
         lint_menu = menubar.addMenu('🔍 Lint')
@@ -764,7 +966,15 @@ class CodeyApp(QtWidgets.QMainWindow):
             return
         self.current_lang = tab.lang
         if hasattr(self, 'lang_combo'):
-            lang_map_reverse = {self.LANG_PY: 'Python', self.LANG_JS: 'JavaScript', self.LANG_C: 'C', self.LANG_CPP: 'C++'}
+            lang_map_reverse = {
+                self.LANG_PY: 'Python',
+                self.LANG_JS: 'JavaScript',
+                self.LANG_C: 'C',
+                self.LANG_CPP: 'C++',
+                self.LANG_JSON: 'JSON',
+                self.LANG_LOG: 'LOG',
+                self.LANG_TEXT: 'Plain Text',
+            }
             if tab.lang in lang_map_reverse:
                 self.lang_combo.blockSignals(True)
                 self.lang_combo.setCurrentText(lang_map_reverse[tab.lang])
@@ -829,25 +1039,39 @@ class CodeyApp(QtWidgets.QMainWindow):
         toolbar.addWidget(lang_label)
         
         self.lang_combo = QtWidgets.QComboBox()
-        self.lang_combo.addItems(['Python', 'JavaScript', 'C', 'C++'])
+        self.lang_combo.addItems(['Python', 'JavaScript', 'C', 'C++', 'JSON', 'LOG', 'Plain Text'])
         self.lang_combo.currentTextChanged.connect(self._on_lang_combo_changed)
         self.lang_combo.setMinimumWidth(100)
         toolbar.addWidget(self.lang_combo)
 
     def _on_lang_combo_changed(self, text):
         """Handle language combo box changes."""
-        lang_map = {'Python': self.LANG_PY, 'JavaScript': self.LANG_JS, 'C': self.LANG_C, 'C++': self.LANG_CPP}
+        lang_map = {
+            'Python': self.LANG_PY,
+            'JavaScript': self.LANG_JS,
+            'C': self.LANG_C,
+            'C++': self.LANG_CPP,
+            'JSON': self.LANG_JSON,
+            'LOG': self.LANG_LOG,
+            'Plain Text': self.LANG_TEXT,
+        }
         if text in lang_map:
             self.set_language(lang_map[text])
 
     def _build_sidebar(self):
+        base = self._workspace_path or QtCore.QDir.currentPath()
+        self._reload_ignore_patterns(base)
         if hasattr(QtWidgets, 'QFileSystemModel'):
             self.fs_model = QtWidgets.QFileSystemModel()
-            self.fs_model.setRootPath(QtCore.QDir.currentPath())
+            self.fs_model.setRootPath(base)
+            self.fs_proxy = IgnoreFilterProxyModel(self)
+            self.fs_proxy.setSourceModel(self.fs_model)
+            self.fs_proxy.set_ignore_data(base, self._ignore_patterns)
 
             self.file_tree = QtWidgets.QTreeView()
-            self.file_tree.setModel(self.fs_model)
-            self.file_tree.setRootIndex(self.fs_model.index(QtCore.QDir.currentPath()))
+            self.file_tree.setModel(self.fs_proxy)
+            source_root = self.fs_model.index(base)
+            self.file_tree.setRootIndex(self.fs_proxy.mapFromSource(source_root))
             self.file_tree.setHeaderHidden(True)
             for col in range(1, 4):
                 self.file_tree.hideColumn(col)
@@ -859,10 +1083,12 @@ class CodeyApp(QtWidgets.QMainWindow):
         else:
             # Fallback for older PyQt6 builds missing QFileSystemModel
             self.fs_model = None
+            self.fs_proxy = None
             self.file_tree = QtWidgets.QTreeWidget()
             self.file_tree.setHeaderHidden(True)
             self._populate_tree_widget()
             self.file_tree.itemDoubleClicked.connect(self._open_from_tree_widget)
+            self.file_tree.itemExpanded.connect(self._on_tree_item_expanded)
 
         dock = QtWidgets.QDockWidget('📂 Files', self)
         dock.setWidget(self.file_tree)
@@ -880,9 +1106,18 @@ class CodeyApp(QtWidgets.QMainWindow):
 
     def _refresh_file_tree(self):
         """Refresh the file tree."""
+        base = self._workspace_path or QtCore.QDir.currentPath()
+        self._reload_ignore_patterns(base)
         if self.fs_model:
-            self.fs_model.setRootPath(QtCore.QDir.currentPath())
-            self.file_tree.setRootIndex(self.fs_model.index(QtCore.QDir.currentPath()))
+            self.fs_model.setRootPath(base)
+            if self.fs_proxy:
+                self.fs_proxy.set_ignore_data(base, self._ignore_patterns)
+                self.file_tree.setRootIndex(self.fs_proxy.mapFromSource(self.fs_model.index(base)))
+            else:
+                self.file_tree.setRootIndex(self.fs_model.index(base))
+        else:
+            self.file_tree.clear()
+            self._populate_tree_widget()
 
     def _build_bottom_panel(self):
         self.diagnostics_list = QtWidgets.QListWidget()
@@ -893,6 +1128,91 @@ class CodeyApp(QtWidgets.QMainWindow):
         dock.setWidget(self.diagnostics_list)
         dock.setObjectName('LintDock')
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+
+    def _build_find_panel(self):
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout(container)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+
+        self.find_files_results = QtWidgets.QListWidget()
+        self.find_files_results.itemActivated.connect(self._open_find_result)
+        self.find_files_results.itemDoubleClicked.connect(self._open_find_result)
+
+        hint = QtWidgets.QLabel('Use the top search box, then press Ctrl+Shift+F')
+        hint.setStyleSheet('color: #9aa4b2; padding: 2px;')
+        layout.addWidget(hint)
+        layout.addWidget(self.find_files_results, 1)
+
+        dock = QtWidgets.QDockWidget('🔎 Find in Files', self)
+        dock.setWidget(container)
+        dock.setObjectName('FindFilesDock')
+        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
+    def _focus_find_in_files(self):
+        if hasattr(self, 'search_input'):
+            self.search_input.setFocus()
+
+    def _start_find_in_files(self):
+        query = self.search_input.text().strip() if hasattr(self, 'search_input') else ''
+        if not query:
+            self.set_status('Find in files: empty query')
+            return
+        workspace = self._workspace_path or os.getcwd()
+        if self._find_worker and self._find_worker.isRunning():
+            self._find_worker.requestInterruption()
+            self._find_worker.wait(1000)
+        max_results = int(self._settings.get('find_max_results', 500))
+        self.find_files_results.clear()
+        self._find_worker = FindInFilesWorker(
+            workspace_root=workspace,
+            query=query,
+            case_sensitive=False,
+            max_results=max_results,
+            ignore_patterns=self._ignore_patterns,
+            parent=self,
+        )
+        self._find_worker.result.connect(self._on_find_in_files_result)
+        self._find_worker.error.connect(self._on_find_in_files_error)
+        self._find_worker.finished.connect(self._on_find_in_files_finished)
+        self._find_worker.start()
+        self.set_status(f'Find in files: searching for "{query}"...')
+
+    def _on_find_in_files_result(self, results):
+        self.find_files_results.clear()
+        for item in results:
+            rel = os.path.relpath(item['path'], self._workspace_path) if self._workspace_path else item['path']
+            text = f"{rel}:{item['line']}  {item['text']}"
+            lw = QtWidgets.QListWidgetItem(text)
+            lw.setData(QtCore.Qt.ItemDataRole.UserRole, item)
+            self.find_files_results.addItem(lw)
+        self.set_status(f'Find in files: {len(results)} result(s)')
+
+    def _on_find_in_files_error(self, message):
+        self.set_status(f'Find in files failed: {message}')
+
+    def _on_find_in_files_finished(self):
+        self._find_worker = None
+
+    def _open_find_result(self, item):
+        data = item.data(QtCore.Qt.ItemDataRole.UserRole) or {}
+        path = data.get('path')
+        line_no = int(data.get('line', 1))
+        if not path:
+            return
+        self._open_path(path, new_tab=True)
+        editor = self._current_editor()
+        if not editor:
+            return
+        cursor = editor.textCursor()
+        cursor.movePosition(QtGui.QTextCursor.MoveOperation.Start)
+        cursor.movePosition(
+            QtGui.QTextCursor.MoveOperation.Down,
+            QtGui.QTextCursor.MoveMode.MoveAnchor,
+            max(0, line_no - 1)
+        )
+        editor.setTextCursor(cursor)
+        editor.setFocus()
     
     def _build_terminal_panel(self):
         container = QtWidgets.QWidget()
@@ -1121,6 +1441,8 @@ class CodeyApp(QtWidgets.QMainWindow):
                 os.makedirs(app_dir, exist_ok=True)
             except Exception:
                 app_dir = os.getcwd()
+        self._app_dir = app_dir
+        self._settings_path = os.path.join(app_dir, 'codey.settings.json')
         self._db_path = os.path.join(app_dir, 'codey.db')
         try:
             self._db = sqlite3.connect(self._db_path)
@@ -1133,9 +1455,220 @@ class CodeyApp(QtWidgets.QMainWindow):
                 " updated_at INTEGER"
                 ")"
             )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS session_state ("
+                " key TEXT PRIMARY KEY,"
+                " value TEXT"
+                ")"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS session_tabs ("
+                " tab_index INTEGER,"
+                " path TEXT,"
+                " line INTEGER,"
+                " col INTEGER"
+                ")"
+            )
             self._db.commit()
         except Exception:
             self._db = None
+
+    def _default_settings(self):
+        return {
+            'font_size': 12,
+            'autosave_delay_ms': 800,
+            'lint_delay_ms': 600,
+            'restore_last_session': True,
+            'max_recent_items': 10,
+            'find_max_results': 500,
+            'recent_files': [],
+            'recent_workspaces': [],
+        }
+
+    def _load_settings(self):
+        defaults = self._default_settings()
+        self._settings = dict(defaults)
+        if not self._settings_path:
+            return
+        if not os.path.isfile(self._settings_path):
+            self._save_settings()
+            return
+        try:
+            with open(self._settings_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self._settings.update(data)
+        except Exception:
+            self._settings = dict(defaults)
+            self._save_settings()
+
+    def _save_settings(self):
+        if not self._settings_path:
+            return
+        try:
+            with open(self._settings_path, 'w', encoding='utf-8') as f:
+                json.dump(self._settings, f, indent=2)
+        except Exception:
+            return
+
+    def _apply_settings(self):
+        try:
+            autosave_delay = int(self._settings.get('autosave_delay_ms', 800))
+            lint_delay = int(self._settings.get('lint_delay_ms', 600))
+            font_size = int(self._settings.get('font_size', 12))
+        except Exception:
+            autosave_delay, lint_delay, font_size = 800, 600, 12
+        self._autosave_timer.setInterval(max(200, autosave_delay))
+        self._lint_timer.setInterval(max(200, lint_delay))
+        self._set_editor_font_size(max(8, min(28, font_size)))
+
+    def _set_editor_font_size(self, size):
+        font = QtGui.QFont('JetBrains Mono', size)
+        QtWidgets.QApplication.setFont(font)
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if tab:
+                tab.editor.setFont(font)
+
+    def _open_settings_file(self):
+        if not self._settings_path:
+            return
+        try:
+            if not os.path.isfile(self._settings_path):
+                self._save_settings()
+            self._open_path(self._settings_path, new_tab=True)
+        except Exception as exc:
+            self.set_status(f'Open settings failed: {exc}')
+
+    def _push_recent_value(self, key, value):
+        if not value:
+            return
+        max_items = int(self._settings.get('max_recent_items', 10))
+        items = list(self._settings.get(key, []))
+        items = [x for x in items if x != value]
+        items.insert(0, value)
+        self._settings[key] = items[:max(1, max_items)]
+        self._save_settings()
+
+    def _add_recent_file(self, path):
+        self._push_recent_value('recent_files', path)
+
+    def _add_recent_workspace(self, path):
+        self._push_recent_value('recent_workspaces', path)
+
+    def _populate_recent_files_menu(self):
+        self.recent_files_menu.clear()
+        items = self._settings.get('recent_files', [])
+        if not items:
+            action = self.recent_files_menu.addAction('(empty)')
+            action.setEnabled(False)
+            return
+        for path in items:
+            action = self.recent_files_menu.addAction(path)
+            action.triggered.connect(lambda _checked=False, p=path: self._open_recent_file(p))
+        self.recent_files_menu.addSeparator()
+        clear_action = self.recent_files_menu.addAction('Clear Recent Files')
+        clear_action.triggered.connect(self._clear_recent_files)
+
+    def _populate_recent_workspaces_menu(self):
+        self.recent_workspaces_menu.clear()
+        items = self._settings.get('recent_workspaces', [])
+        if not items:
+            action = self.recent_workspaces_menu.addAction('(empty)')
+            action.setEnabled(False)
+            return
+        for path in items:
+            action = self.recent_workspaces_menu.addAction(path)
+            action.triggered.connect(lambda _checked=False, p=path: self._open_recent_workspace(p))
+        self.recent_workspaces_menu.addSeparator()
+        clear_action = self.recent_workspaces_menu.addAction('Clear Recent Workspaces')
+        clear_action.triggered.connect(self._clear_recent_workspaces)
+
+    def _open_recent_file(self, path):
+        if path and os.path.isfile(path):
+            self._open_path(path, new_tab=True)
+        else:
+            self.set_status('Recent file missing')
+
+    def _open_recent_workspace(self, path):
+        if path and os.path.isdir(path):
+            self._set_workspace(path)
+        else:
+            self.set_status('Recent workspace missing')
+
+    def _clear_recent_files(self):
+        self._settings['recent_files'] = []
+        self._save_settings()
+
+    def _clear_recent_workspaces(self):
+        self._settings['recent_workspaces'] = []
+        self._save_settings()
+
+    def _restore_session(self):
+        if not self._db or not bool(self._settings.get('restore_last_session', True)):
+            return False
+        try:
+            cur = self._db.cursor()
+            cur.execute("SELECT value FROM session_state WHERE key = 'workspace'")
+            row = cur.fetchone()
+            workspace = row[0] if row else None
+            cur.execute("SELECT tab_index, path, line, col FROM session_tabs ORDER BY tab_index ASC")
+            tabs = cur.fetchall()
+        except Exception:
+            return False
+        restored = False
+        if workspace and os.path.isdir(workspace):
+            self._set_workspace(workspace)
+            restored = True
+        valid_tabs = [t for t in tabs if t[1] and os.path.isfile(t[1])]
+        if valid_tabs:
+            while self.tabs.count() > 0:
+                self.tabs.removeTab(0)
+            for _idx, path, line, col in valid_tabs:
+                self._open_path(path, new_tab=True)
+                tab = self._current_tab()
+                if tab:
+                    cursor = tab.editor.textCursor()
+                    cursor.movePosition(QtGui.QTextCursor.MoveOperation.Start)
+                    cursor.movePosition(
+                        QtGui.QTextCursor.MoveOperation.Down,
+                        QtGui.QTextCursor.MoveMode.MoveAnchor,
+                        max(0, int(line or 1) - 1)
+                    )
+                    cursor.movePosition(
+                        QtGui.QTextCursor.MoveOperation.Right,
+                        QtGui.QTextCursor.MoveMode.MoveAnchor,
+                        max(0, int(col or 1) - 1)
+                    )
+                    tab.editor.setTextCursor(cursor)
+            restored = True
+        return restored
+
+    def _save_session(self):
+        if not self._db:
+            return
+        try:
+            cur = self._db.cursor()
+            cur.execute("DELETE FROM session_tabs")
+            workspace = self._workspace_path or ''
+            cur.execute(
+                "INSERT OR REPLACE INTO session_state(key, value) VALUES ('workspace', ?)",
+                (workspace,)
+            )
+            for i in range(self.tabs.count()):
+                tab = self.tabs.widget(i)
+                if not tab or not tab.path:
+                    continue
+                cursor = tab.editor.textCursor()
+                line = cursor.blockNumber() + 1
+                col = cursor.columnNumber() + 1
+                cur.execute(
+                    "INSERT INTO session_tabs(tab_index, path, line, col) VALUES (?, ?, ?, ?)",
+                    (i, tab.path, line, col)
+                )
+            self._db.commit()
+        except Exception:
+            return
 
     def _init_freeze_handler(self):
         self._last_heartbeat = time.time()
@@ -1166,7 +1699,14 @@ class CodeyApp(QtWidgets.QMainWindow):
         self._last_heartbeat = time.time()
 
     def set_status(self, text):
-        self.statusbar.showMessage(text, 5000)  # Show for 5 seconds
+        if self._is_closing:
+            return
+        try:
+            if hasattr(self, 'statusbar') and self.statusbar:
+                self.statusbar.showMessage(text, 5000)  # Show for 5 seconds
+        except RuntimeError:
+            # Async callbacks can fire while the main window is being destroyed.
+            return
 
     def _on_buffer_changed(self, *_):
         tab = self._current_tab()
@@ -1178,9 +1718,9 @@ class CodeyApp(QtWidgets.QMainWindow):
         
         # Debounce linting during active edits
         if hasattr(self, '_lint_timer'):
-            self._lint_timer.start(600)
+            self._lint_timer.start()
         if hasattr(self, '_autosave_timer'):
-            self._autosave_timer.start(800)
+            self._autosave_timer.start()
 
     def _update_window_title(self):
         """Update window title with file name and modified status."""
@@ -1214,7 +1754,15 @@ class CodeyApp(QtWidgets.QMainWindow):
         self.current_lang = lang
         
         # Update combo box without triggering signal
-        lang_map_reverse = {self.LANG_PY: 'Python', self.LANG_JS: 'JavaScript', self.LANG_C: 'C', self.LANG_CPP: 'C++'}
+        lang_map_reverse = {
+            self.LANG_PY: 'Python',
+            self.LANG_JS: 'JavaScript',
+            self.LANG_C: 'C',
+            self.LANG_CPP: 'C++',
+            self.LANG_JSON: 'JSON',
+            self.LANG_LOG: 'LOG',
+            self.LANG_TEXT: 'Plain Text',
+        }
         if lang in lang_map_reverse:
             self.lang_combo.blockSignals(True)
             self.lang_combo.setCurrentText(lang_map_reverse[lang])
@@ -1247,6 +1795,12 @@ class CodeyApp(QtWidgets.QMainWindow):
             return self.LANG_C
         if ext in ('.cpp', '.cc', '.cxx', '.hpp', '.hh'):
             return self.LANG_CPP
+        if ext in ('.json',):
+            return self.LANG_JSON
+        if ext in ('.log',):
+            return self.LANG_LOG
+        if ext in ('.txt',):
+            return self.LANG_TEXT
         return self.current_lang
 
     def on_new(self, *_):
@@ -1274,7 +1828,9 @@ class CodeyApp(QtWidgets.QMainWindow):
     def on_open(self, *_):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, 'Open File', os.getcwd(), 
-            'All Supported Files (*.py *.c *.cpp *.h *.hpp *.cc *.cxx);;'
+            'All Supported Files (*.py *.js *.mjs *.cjs *.jsx *.c *.cpp *.h *.hpp *.cc *.cxx *.json *.log *.txt);;'
+            'JSON Files (*.json);;Log Files (*.log);;Text Files (*.txt);;'
+            'JavaScript Files (*.js *.mjs *.cjs *.jsx);;'
             'Python Files (*.py);;C/C++ Files (*.c *.cpp *.h *.hpp *.cc *.cxx);;'
             'All Files (*)')
         if not path:
@@ -1295,6 +1851,8 @@ class CodeyApp(QtWidgets.QMainWindow):
                 f.write(self._get_text())
             tab.is_modified = False
             self._update_window_title()
+            self._record_file_mtime(tab.path)
+            self._add_recent_file(tab.path)
             self.set_status(f'✓ Saved: {os.path.basename(tab.path)}')
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, 'Save Error', str(exc))
@@ -1303,7 +1861,8 @@ class CodeyApp(QtWidgets.QMainWindow):
     def on_save_as(self, *_):
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, 'Save File', '', 
-            'Python Files (*.py);;C Files (*.c);;C++ Files (*.cpp);;'
+            'Python Files (*.py);;JavaScript Files (*.js);;JSON Files (*.json);;'
+            'Log Files (*.log);;Text Files (*.txt);;C Files (*.c);;C++ Files (*.cpp);;'
             'Header Files (*.h *.hpp);;All Files (*)')
         if path:
             tab = self._current_tab()
@@ -1313,18 +1872,69 @@ class CodeyApp(QtWidgets.QMainWindow):
             self.on_save()
 
     def _open_from_tree(self, index):
-        path = self.fs_model.filePath(index)
+        source_index = self.fs_proxy.mapToSource(index) if self.fs_proxy else index
+        path = self.fs_model.filePath(source_index)
         if os.path.isdir(path):
             return
         self._open_path(path, new_tab=True)
 
     def _populate_tree_widget(self):
-        root_path = os.getcwd()
+        root_path = self._workspace_path or os.getcwd()
         root_item = QtWidgets.QTreeWidgetItem([os.path.basename(root_path) or root_path])
         root_item.setData(0, QtCore.Qt.ItemDataRole.UserRole, root_path)
+        root_item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, False)
         self.file_tree.addTopLevelItem(root_item)
-        self._add_tree_children(root_item, root_path)
-        root_item.setExpanded(True)
+        if self._dir_has_visible_children(root_path):
+            root_item.addChild(QtWidgets.QTreeWidgetItem(['']))
+
+    def _set_workspace(self, path):
+        if not path or not os.path.isdir(path):
+            return
+        self._workspace_path = path
+        self._add_recent_workspace(path)
+        self._reload_ignore_patterns(path)
+        if self.fs_model:
+            self.fs_model.setRootPath(path)
+            if self.fs_proxy:
+                self.fs_proxy.set_ignore_data(path, self._ignore_patterns)
+                self.file_tree.setRootIndex(self.fs_proxy.mapFromSource(self.fs_model.index(path)))
+            else:
+                self.file_tree.setRootIndex(self.fs_model.index(path))
+        else:
+            self.file_tree.clear()
+            self._populate_tree_widget()
+        self.set_status(f'Workspace: {path}')
+
+    def _reload_ignore_patterns(self, workspace_root):
+        self._ignore_patterns = []
+        if not workspace_root:
+            return
+        ignore_file = os.path.join(workspace_root, '.codeyignore')
+        if not os.path.isfile(ignore_file):
+            return
+        try:
+            with open(ignore_file, 'r', encoding='utf-8', errors='replace') as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    self._ignore_patterns.append(line.replace('\\', '/'))
+        except Exception:
+            self._ignore_patterns = []
+
+    def _is_ignored_path(self, abs_path):
+        return _path_matches_ignore(abs_path, self._workspace_path, self._ignore_patterns)
+
+    def _prompt_for_workspace(self, initial=False):
+        base = self._workspace_path or os.getcwd()
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self, 'Select Folder', base
+        )
+        if not path:
+            if initial:
+                self.set_status('No folder selected')
+            return
+        self._set_workspace(path)
 
     def _add_tree_children(self, parent_item, path):
         try:
@@ -1338,6 +1948,8 @@ class CodeyApp(QtWidgets.QMainWindow):
             if name.startswith('.'):
                 continue
             full = os.path.join(path, name)
+            if self._is_ignored_path(full):
+                continue
             if os.path.isdir(full):
                 dirs.append(name)
             else:
@@ -1347,8 +1959,10 @@ class CodeyApp(QtWidgets.QMainWindow):
             full = os.path.join(path, dirname)
             child = QtWidgets.QTreeWidgetItem([f'📁 {dirname}'])
             child.setData(0, QtCore.Qt.ItemDataRole.UserRole, full)
+            child.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, False)
             parent_item.addChild(child)
-            self._add_tree_children(child, full)
+            if self._dir_has_visible_children(full):
+                child.addChild(QtWidgets.QTreeWidgetItem(['']))
 
         for filename in sorted(files):
             full = os.path.join(path, filename)
@@ -1361,14 +1975,65 @@ class CodeyApp(QtWidgets.QMainWindow):
             child.setData(0, QtCore.Qt.ItemDataRole.UserRole, full)
             parent_item.addChild(child)
 
+    def _dir_has_visible_children(self, path):
+        try:
+            for name in os.listdir(path):
+                if name.startswith('.'):
+                    continue
+                full = os.path.join(path, name)
+                if self._is_ignored_path(full):
+                    continue
+                if os.path.exists(full):
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _on_tree_item_expanded(self, item):
+        path = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
+        if not path or not os.path.isdir(path):
+            return
+        loaded = bool(item.data(0, QtCore.Qt.ItemDataRole.UserRole + 1))
+        if loaded:
+            return
+        item.takeChildren()
+        self._add_tree_children(item, path)
+        item.setData(0, QtCore.Qt.ItemDataRole.UserRole + 1, True)
+
     def _open_from_tree_widget(self, item, _col):
         path = item.data(0, QtCore.Qt.ItemDataRole.UserRole)
         if not path or os.path.isdir(path):
             return
         self._open_path(path, new_tab=True)
 
+    def _is_probably_binary_file(self, path):
+        try:
+            with open(path, 'rb') as f:
+                chunk = f.read(4096)
+        except Exception:
+            return False
+        if not chunk:
+            return False
+        if b'\x00' in chunk:
+            return True
+        text_bytes = bytearray({7, 8, 9, 10, 12, 13, 27} | set(range(0x20, 0x7F)))
+        non_text = chunk.translate(None, text_bytes)
+        return (len(non_text) / float(len(chunk))) > 0.30
+
     def _open_path(self, path, new_tab=False):
         try:
+            if self._is_probably_binary_file(path):
+                reply = QtWidgets.QMessageBox.warning(
+                    self,
+                    'Binary File Warning',
+                    'Warning: This file appears to be binary and may freeze Codey if opened as text.\n\n'
+                    'Do you want to continue anyway?',
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No
+                )
+                if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                    self.set_status('Open canceled: binary file warning')
+                    return
             with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
             if new_tab:
@@ -1384,9 +2049,51 @@ class CodeyApp(QtWidgets.QMainWindow):
             self.set_status(f'✓ Opened: {os.path.basename(path)}')
             self._clear_diagnostics()
             self._restore_draft_for_path(path)
+            self._add_recent_file(path)
+            self._record_file_mtime(path)
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, 'Open Error', str(exc))
             self.set_status(f'Open failed: {exc}')
+
+    def _record_file_mtime(self, path):
+        if not path:
+            return
+        try:
+            self._file_mtimes[path] = os.path.getmtime(path)
+        except Exception:
+            return
+
+    def _check_open_files_changed(self):
+        if self._is_closing:
+            return
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if not tab or not tab.path:
+                continue
+            try:
+                current_mtime = os.path.getmtime(tab.path)
+            except Exception:
+                continue
+            old_mtime = self._file_mtimes.get(tab.path)
+            if old_mtime is None:
+                self._file_mtimes[tab.path] = current_mtime
+                continue
+            if current_mtime <= old_mtime:
+                continue
+            self._file_mtimes[tab.path] = current_mtime
+            if tab.is_modified:
+                continue
+            current_tab = self.tabs.currentIndex()
+            self.tabs.setCurrentIndex(i)
+            reply = QtWidgets.QMessageBox.question(
+                self, 'File Changed',
+                f'{os.path.basename(tab.path)} changed on disk. Reload it?',
+                QtWidgets.QMessageBox.StandardButton.Yes |
+                QtWidgets.QMessageBox.StandardButton.No
+            )
+            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                self._open_path(tab.path, new_tab=False)
+            self.tabs.setCurrentIndex(current_tab)
 
     def _search_next(self):
         term = self.search_input.text()
@@ -1495,6 +2202,15 @@ class CodeyApp(QtWidgets.QMainWindow):
 
     def _shutdown_threads(self):
         self._is_closing = True
+        if self._file_watch_timer:
+            self._file_watch_timer.stop()
+        if self._find_worker and self._find_worker.isRunning():
+            self._find_worker.requestInterruption()
+            self._find_worker.wait(2000)
+            if self._find_worker.isRunning():
+                self._find_worker.terminate()
+                self._find_worker.wait(500)
+            self._find_worker = None
         if self._lint_worker and self._lint_worker.isRunning():
             self._lint_worker.requestInterruption()
             self._lint_worker.wait(5000)
@@ -1503,6 +2219,10 @@ class CodeyApp(QtWidgets.QMainWindow):
                 self._lint_worker.wait(1000)
             if not self._lint_worker.isRunning():
                 self._lint_worker = None
+        if self._run_process:
+            self._run_process.terminate()
+            self._run_process.waitForFinished(1000)
+            self._run_process = None
         if self._terminal_process:
             self._terminal_process.terminate()
             self._terminal_process.waitForFinished(1000)
@@ -1578,6 +2298,8 @@ class CodeyApp(QtWidgets.QMainWindow):
             self._run_c_family(tab.path, is_cpp=False)
         elif lang == self.LANG_CPP:
             self._run_c_family(tab.path, is_cpp=True)
+        elif lang in (self.LANG_JSON, self.LANG_LOG, self.LANG_TEXT):
+            self.set_status('Run: not supported for this file type')
         else:
             self.set_status('Run: unsupported language')
 
@@ -1628,6 +2350,8 @@ class CodeyApp(QtWidgets.QMainWindow):
             self.set_status('Run failed')
 
     def _on_run_finished(self, exit_code, label, run_after):
+        if self._is_closing:
+            return
         if run_after and exit_code == 0:
             if hasattr(self, 'terminal_output'):
                 self.terminal_output.appendPlainText('> ' + run_after)
@@ -1741,7 +2465,7 @@ class CodeyApp(QtWidgets.QMainWindow):
         about_text = (
             "<h2>Codey Code Editor</h2>"
             "<p>A lightweight multi-language code editor with linting support.</p>"
-            "<p><b>Supported Languages:</b> Python, JavaScript, C, C++</p>"
+            "<p><b>Supported Languages:</b> Python, JavaScript, C, C++, JSON, LOG, Plain Text</p>"
             "<p><b>Features:</b></p>"
             "<ul>"
             "<li>Syntax checking with CodeyLinter</li>"
@@ -1821,14 +2545,17 @@ class CodeyApp(QtWidgets.QMainWindow):
                         return
                     if current and current.path:
                         self._clear_draft_for_path(current.path)
+                self._save_session()
                 event.accept()
             elif reply == QtWidgets.QMessageBox.StandardButton.Discard:
                 self._autosave_draft()
+                self._save_session()
                 event.accept()
             else:
                 event.ignore()
         else:
             self._autosave_draft()
+            self._save_session()
             event.accept()
 
 
